@@ -81,12 +81,14 @@ Take a full Home Assistant backup first.
    the host:
 
    ```sh
-   docker run --rm -v /mnt/data/supervisor/addons/data:/d alpine ls -la /d | grep bitwarden
+   docker run --rm -v /mnt/data/supervisor/apps/data:/d alpine ls -la /d | grep bitwarden
    ```
 
-   On a Supervised (non-HA OS) install the base path is
-   `/usr/share/hassio/addons/data`. To settle it authoritatively, ask Docker
-   where the running add-on's `/data` actually lives:
+   The base path varies. Current Supervisor uses `apps/data`; older versions
+   used `addons/data`, and Supervised (non-HA OS) installs live under
+   `/usr/share/hassio/`. Don't guess — ask Docker where the running add-on's
+   `/data` actually is. Note that `Source` is a *host* path, which is why it
+   looks missing from inside the SSH container:
 
    ```sh
    docker inspect addon_<old_hash>_bitwarden \
@@ -99,7 +101,7 @@ Take a full Home Assistant backup first.
 4. Copy, preserving ownership and permissions:
 
    ```sh
-   docker run --rm -v /mnt/data/supervisor/addons/data:/d alpine \
+   docker run --rm -v /mnt/data/supervisor/apps/data:/d alpine \
      sh -c 'cp -a /d/<old_hash>_bitwarden/. /d/<new_hash>_bitwarden/ && ls -la /d/<new_hash>_bitwarden'
    ```
 
