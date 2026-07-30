@@ -62,35 +62,78 @@ in a per-instance `/data` volume — the SQLite database, the RSA keypair that
 signs client tokens, and any attachments. A different add-on instance means a
 different volume.
 
+Note on naming: the add-on's **slug is `bitwarden`**, not `vaultwarden` — a
+legacy name upstream never changed. The display name is "Vaultwarden" but the
+container and data directory are `<repo_hash>_bitwarden`. There is no separate
+Bitwarden add-on.
+
 Take a full Home Assistant backup first.
 
-1. Install "Vaultwarden (dig)" but **do not start it**.
-2. Stop the official Vaultwarden add-on.
-3. Shell into the host — the *Advanced SSH & Web Terminal* add-on with
-   protection mode **off**, so `/mnt/data` is reachable.
-4. Find both data directories:
+1. Add this repository and install "Vaultwarden (dig)", but **do not start it**.
+   Supervisor creates the data directory at install time — before that it does
+   not exist, which is the usual reason people can't find it.
+
+2. Open the *Advanced SSH & Web Terminal* add-on. Protection mode must be
+   **off**, but note what that actually gets you: the Docker API, **not** the
+   host filesystem. `/mnt/data/supervisor/...` is not mounted into that
+   container and will appear missing. Reach host paths through a throwaway
+   container instead — `docker run` bind mounts are resolved by the daemon on
+   the host:
 
    ```sh
-   ls -d /mnt/data/supervisor/addons/data/*bitwarden*
+   docker run --rm -v /mnt/data/supervisor/addons/data:/d alpine ls -la /d | grep bitwarden
    ```
 
-   The official one is `<hash>_bitwarden`; this fork is a different `<hash>_bitwarden`.
-   `ls -la` on each disambiguates — the official one has `db.sqlite3` and a
-   recent mtime, the new one is empty or near-empty.
-
-5. Copy, preserving ownership and permissions:
+   On a Supervised (non-HA OS) install the base path is
+   `/usr/share/hassio/addons/data`. To settle it authoritatively, ask Docker
+   where the running add-on's `/data` actually lives:
 
    ```sh
-   cp -a /mnt/data/supervisor/addons/data/<old_hash>_bitwarden/. \
-         /mnt/data/supervisor/addons/data/<new_hash>_bitwarden/
+   docker inspect addon_<old_hash>_bitwarden \
+     --format '{{range .Mounts}}{{.Source}} -> {{.Destination}}{{"\n"}}{{end}}'
    ```
 
-6. Copy your add-on options across in the UI (SSL, certfile, keyfile,
-   `request_size_limit`) — those live in the add-on config, not `/data`.
-7. Start the fork. Confirm you can log in and see your vault **before**
+3. Stop the official Vaultwarden add-on. Copying a live SQLite database risks a
+   torn read; stopped, the WAL is checkpointed cleanly.
+
+4. Copy, preserving ownership and permissions:
+
+   ```sh
+   docker run --rm -v /mnt/data/supervisor/addons/data:/d alpine \
+     sh -c 'cp -a /d/<old_hash>_bitwarden/. /d/<new_hash>_bitwarden/ && ls -la /d/<new_hash>_bitwarden'
+   ```
+
+   Copy the **whole directory**, not just `db.sqlite3` — leaving the `-wal`
+   sidecar behind loses everything not yet checkpointed.
+
+5. Copy your add-on options across (SSL, certfile, keyfile,
+   `request_size_limit`) — those live in the add-on config, not `/data`. Watch
+   the `ssl` default: this add-on ships `ssl: true`, so if your existing install
+   has it off, set it off here too.
+
+6. Start the fork. Confirm you can log in and see your vault **before**
    uninstalling the official add-on.
 
 Both add-ons bind host port 7277, so only one can run at a time.
+
+## Export/import instead?
+
+Bitwarden's JSON export is a *vault items* export, not a backup, and it is the
+lossy option. It omits file attachments entirely, along with Sends, trash,
+emergency access contacts, organization items (each org exports separately), and
+the RSA keypair — so every client has to log out and back in. TOTP secrets and
+folders do survive; item revision dates reset.
+
+The `/data` copy above has none of those gaps: it moves the server's actual
+state, and clients never notice.
+
+If you do export, the trap is the format. **"Account restricted" encrypted JSON
+can only be imported back into the same account** — it's sealed with that
+account's key and is useless for moving instances. Use **password-protected**
+encrypted JSON, or plain `.json` (cleartext secrets on disk — shred it after).
+
+Best practice: take a password-protected export as a *rollback artifact*, then
+migrate by copying `/data`. The export is your safety net, not the mechanism.
 
 ## Going back to upstream
 
