@@ -1,0 +1,179 @@
+---
+name: Nightly
+
+# yamllint disable-line rule:truthy
+on:
+  schedule:
+    # 07:00 UTC — early morning US Eastern
+    - cron: "0 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+concurrency:
+  group: nightly
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/hassio-addons/app-vaultwarden.git
+
+jobs:
+  nightly:
+    name: Sync, bump and verify
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Check out the repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🔧 Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # ----------------------------------------------------------------------
+      # Merge upstream. Conflicts in .github/ are ours by construction (we
+      # deleted their org-specific CI), so those resolve automatically. Anything
+      # else — realistically the Dockerfile, once upstream ships its own bump —
+      # becomes a PR for a human.
+      # ----------------------------------------------------------------------
+      - name: ⬇️ Merge upstream
+        id: sync
+        run: |
+          git remote add upstream "${UPSTREAM}"
+          git fetch --quiet upstream main
+
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "Already up to date with upstream."
+            echo "glue_changed=false" >>"$GITHUB_OUTPUT"
+            echo "conflict=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          before=$(git rev-parse HEAD)
+
+          if ! git merge --no-edit upstream/main; then
+            # Resolve modify/delete conflicts for files we intentionally removed.
+            for f in $(git diff --name-only --diff-filter=U); do
+              if ! git cat-file -e "HEAD:${f}" 2>/dev/null; then
+                echo "Keeping our deletion of ${f}"
+                git rm -q -f "${f}"
+              fi
+            done
+
+            remaining=$(git diff --name-only --diff-filter=U)
+            if [[ -n "${remaining}" ]]; then
+              echo "::warning::Unresolvable conflicts, opening a PR instead:"
+              echo "${remaining}"
+              git merge --abort
+              echo "conflict=true" >>"$GITHUB_OUTPUT"
+              echo "glue_changed=false" >>"$GITHUB_OUTPUT"
+              exit 0
+            fi
+            git commit --no-edit
+          fi
+
+          after=$(git rev-parse HEAD)
+          [[ "${before}" != "${after}" ]] && changed=true || changed=false
+          echo "glue_changed=${changed}" >>"$GITHUB_OUTPUT"
+          echo "conflict=false" >>"$GITHUB_OUTPUT"
+
+      - name: 🔀 Open a sync PR for manual resolution
+        if: steps.sync.outputs.conflict == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git push --force origin refs/remotes/upstream/main:refs/heads/upstream-sync
+          if [[ -z "$(gh pr list --head upstream-sync --state open --json number --jq '.[].number')" ]]; then
+            gh pr create --head upstream-sync --base main \
+              --title "⬆️ Merge upstream changes (manual resolution needed)" \
+              --body "The nightly job could not merge \`hassio-addons/app-vaultwarden@main\` cleanly. Resolve the conflicts here — usually the Dockerfile, where upstream has caught up to a Vaultwarden bump we already shipped."
+          else
+            echo "Sync PR already open."
+          fi
+
+      - name: ⬆️ Check for a new Vaultwarden release
+        if: steps.sync.outputs.conflict != 'true'
+        id: bump
+        run: |
+          chmod +x .github/scripts/update-version.sh
+          if [[ "${{ steps.sync.outputs.glue_changed }}" == "true" ]]; then
+            .github/scripts/update-version.sh --glue-changed
+          else
+            .github/scripts/update-version.sh
+          fi
+
+      # ----------------------------------------------------------------------
+      # Always build — both arches, every night. The Debian packages are
+      # unpinned, so this is what catches mirror drift before the HA box does.
+      # ----------------------------------------------------------------------
+      - name: 🏗️ Set up QEMU
+        if: steps.sync.outputs.conflict != 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: 🏗️ Set up Buildx
+        if: steps.sync.outputs.conflict != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: 🧪 Build for amd64 and aarch64
+        if: steps.sync.outputs.conflict != 'true'
+        id: build
+        run: |
+          base=$(sed -nE 's/^  amd64: (.+)$/\1/p' vaultwarden/build.yaml)
+          echo "Base image: ${base}"
+          docker buildx build \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "BUILD_FROM=${base}" \
+            --output type=cacheonly \
+            --progress plain \
+            vaultwarden
+
+      - name: 🚀 Commit, tag and push
+        if: steps.sync.outputs.conflict != 'true' && steps.bump.outputs.changed == 'true'
+        run: |
+          git add -A
+          git commit -m "⬆️ Vaultwarden ${{ steps.bump.outputs.vw_latest }} (add-on v${{ steps.bump.outputs.addon_new }})"
+          git tag "v${{ steps.bump.outputs.addon_new }}"
+          git push origin main
+          git push origin "v${{ steps.bump.outputs.addon_new }}"
+
+      - name: 📤 Push upstream-only changes
+        if: steps.sync.outputs.conflict != 'true' && steps.bump.outputs.changed != 'true' && steps.sync.outputs.glue_changed == 'true'
+        run: git push origin main
+
+      - name: 🚨 Report a broken build
+        if: failure() && steps.build.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          title="🚨 Nightly build failed"
+          existing=$(gh issue list --state open --search "${title} in:title" --json number --jq '.[0].number')
+          body="The nightly build failed, so nothing was pushed — the add-on is still on the last known-good version. [Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})"
+          if [[ -n "${existing}" ]]; then
+            gh issue comment "${existing}" --body "${body}"
+          else
+            gh issue create --title "${title}" --body "${body}"
+          fi
+
+      - name: 📋 Summary
+        if: always()
+        run: |
+          {
+            if [[ "${{ steps.sync.outputs.conflict }}" == "true" ]]; then
+              echo "## 🔀 Upstream needs manual merge"
+            elif [[ "${{ steps.bump.outputs.changed }}" == "true" ]]; then
+              echo "## ✅ Shipped add-on v${{ steps.bump.outputs.addon_new }}"
+              echo ""
+              echo "**Vaultwarden:** ${{ steps.bump.outputs.vw_current }} → ${{ steps.bump.outputs.vw_latest }}"
+            elif [[ "${{ steps.sync.outputs.glue_changed }}" == "true" ]]; then
+              echo "## ✅ Merged upstream changes (no version bump)"
+            else
+              echo "## ℹ️ Nothing to do"
+              echo ""
+              echo "Vaultwarden ${{ steps.bump.outputs.vw_current }} is current; build verified."
+            fi
+          } >>"$GITHUB_STEP_SUMMARY"

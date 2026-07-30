@@ -2,7 +2,7 @@ ARG BUILD_FROM=ghcr.io/hassio-addons/debian-base:9.3.0
 ###############################################################################
 # Get prebuilt containers from Vaultwarden
 ###############################################################################
-FROM "vaultwarden/server:1.36.0" AS vaultwarden
+FROM "vaultwarden/server:1.37.1" AS vaultwarden
 
 ###############################################################################
 # Build the actual app.
@@ -18,15 +18,17 @@ COPY --from=vaultwarden /vaultwarden /opt/vaultwarden
 COPY --from=vaultwarden /web-vault /opt/web-vault
 
 # add Nginx
-# hadolint ignore=DL3009
+# Packages are intentionally unpinned: Debian trixie is stable and only moves on
+# security/point releases, and stale pins are what wedge the upstream build.
+# hadolint ignore=DL3008,DL3009
 RUN \
     apt-get update \
     \
     && apt-get install -y --no-install-recommends \
-        libmariadb-dev-compat=1:11.8.6-0+deb13u1 \
-        libpq5=17.9-0+deb13u1 \
-        nginx=1.26.3-3+deb13u2 \
-        sqlite3=3.46.1-7+deb13u1 \
+        libmariadb-dev-compat \
+        libpq5 \
+        nginx \
+        sqlite3 \
     && apt-get clean \
     && rm -f -r \
         /etc/nginx \

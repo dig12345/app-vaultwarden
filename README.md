@@ -1,3 +1,26 @@
+> [!NOTE]
+> **This is a fork of [hassio-addons/app-vaultwarden][upstream].**
+>
+> It exists to ship Vaultwarden releases without waiting on upstream review. A
+> nightly job merges upstream, bumps to the newest stable `vaultwarden/server`
+> release, builds for amd64 + aarch64, and only then pushes — so a broken build
+> leaves the add-on on the last known-good version rather than shipping it.
+>
+> The Debian package pins are deliberately dropped. Stale pins are what wedge
+> the upstream build; unpinned, `apt` always resolves whatever trixie currently
+> ships.
+>
+> **Install:** add `https://github.com/dig12345/app-vaultwarden` as a custom
+> add-on repository in Home Assistant. There is no prebuilt image — Supervisor
+> builds the add-on on the device, same as the other add-ons in this account.
+>
+> **Migrating from the official add-on:** the vault lives in the add-on's
+> `/data` volume (SQLite DB, RSA keys, attachments). This is a separate add-on
+> instance with an empty `/data`, so copy that directory over before first
+> start. See [FORK.md](FORK.md).
+
+[upstream]: https://github.com/hassio-addons/app-vaultwarden
+
 # Home Assistant Community App: Vaultwarden
 
 [![GitHub Release][releases-shield]][releases]
