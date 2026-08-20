@@ -36,10 +36,13 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       # ----------------------------------------------------------------------
-      # Merge upstream. Conflicts in .github/ are ours by construction (we
-      # deleted their org-specific CI), so those resolve automatically. Anything
-      # else — realistically the Dockerfile, once upstream ships its own bump —
-      # becomes a PR for a human.
+      # Merge upstream. Everything under .github/ is ours by construction — our
+      # CI replaced upstream's org-specific workflows — so conflicts there
+      # resolve to our side automatically, and workflows upstream adds get
+      # dropped (we do not run them, and GITHUB_TOKEN cannot push them anyway).
+      # Conflicts elsewhere — realistically the Dockerfile, where upstream keeps
+      # re-pinning the apt packages we deliberately unpinned — also resolve to
+      # our side, but go to a PR so a human confirms nothing was lost.
       # ----------------------------------------------------------------------
       - name: ⬇️ Merge upstream
         id: sync
@@ -55,46 +58,125 @@ jobs:
           fi
 
           before=$(git rev-parse HEAD)
+          conflict=false
 
-          if ! git merge --no-edit upstream/main; then
-            # Resolve modify/delete conflicts for files we intentionally removed.
-            for f in $(git diff --name-only --diff-filter=U); do
-              if ! git cat-file -e "HEAD:${f}" 2>/dev/null; then
+          # Take our file verbatim under ${1}: our CI is a rewrite, not a
+          # variant, so upstream's version of it is never wanted.
+          keep_our_files() {
+            local f
+            for f in $(git diff --name-only --diff-filter=U -- "$1"); do
+              if git cat-file -e "${before}:${f}" 2>/dev/null; then
+                echo "Keeping our ${f}"
+                git checkout --ours -- "${f}"
+                git add -- "${f}"
+              else
                 echo "Keeping our deletion of ${f}"
-                git rm -q -f "${f}"
+                git rm -q -f -- "${f}"
               fi
             done
+          }
+
+          # Elsewhere, resolve per hunk: our side wins where the two sides
+          # clash, but upstream's untouched changes to the same file survive.
+          keep_our_hunks() {
+            local f tmp
+            tmp=$(mktemp -d)
+            for f in $(git diff --name-only --diff-filter=U); do
+              if ! git cat-file -e "${before}:${f}" 2>/dev/null; then
+                echo "Keeping our deletion of ${f}"
+                git rm -q -f -- "${f}"
+              elif git show ":1:${f}" >"${tmp}/base" 2>/dev/null \
+                && git show ":3:${f}" >"${tmp}/theirs" 2>/dev/null; then
+                echo "Keeping our side of the conflicting hunks in ${f}"
+                git show ":2:${f}" >"${tmp}/ours"
+                git merge-file -q -p --ours \
+                  "${tmp}/ours" "${tmp}/base" "${tmp}/theirs" >"${f}" || true
+                git add -- "${f}"
+              else
+                echo "Keeping our ${f}"
+                git checkout --ours -- "${f}"
+                git add -- "${f}"
+              fi
+            done
+            rm -rf "${tmp}"
+          }
+
+          if ! git merge --no-edit upstream/main; then
+            keep_our_files .github
 
             remaining=$(git diff --name-only --diff-filter=U)
             if [[ -n "${remaining}" ]]; then
-              echo "::warning::Unresolvable conflicts, opening a PR instead:"
+              echo "::warning::Kept our side of conflicting files, sending them to a PR:"
               echo "${remaining}"
-              git merge --abort
-              echo "conflict=true" >>"$GITHUB_OUTPUT"
-              echo "glue_changed=false" >>"$GITHUB_OUTPUT"
-              exit 0
+              conflict=true
+              keep_our_hunks
+              {
+                echo "conflicts<<CONFLICTS_EOF"
+                echo "${remaining}"
+                echo "CONFLICTS_EOF"
+              } >>"$GITHUB_OUTPUT"
             fi
+
             git commit --no-edit
+          fi
+
+          added=$(git diff --name-only --diff-filter=A "${before}" HEAD -- .github)
+          if [[ -n "${added}" ]]; then
+            echo "Dropping upstream workflows we do not run:"
+            echo "${added}"
+            # shellcheck disable=SC2086
+            git rm -q -f -- ${added}
+            git commit -q -m "🧹 Drop upstream .github files we do not use"
           fi
 
           after=$(git rev-parse HEAD)
           [[ "${before}" != "${after}" ]] && changed=true || changed=false
           echo "glue_changed=${changed}" >>"$GITHUB_OUTPUT"
-          echo "conflict=false" >>"$GITHUB_OUTPUT"
+          echo "conflict=${conflict}" >>"$GITHUB_OUTPUT"
 
-      - name: 🔀 Open a sync PR for manual resolution
+      # ----------------------------------------------------------------------
+      # Push the resolved merge — not upstream/main itself, which carries their
+      # workflow files that GITHUB_TOKEN is forbidden from writing. If a sync PR
+      # is already open, leave it alone: a human may be resolving it in place.
+      # ----------------------------------------------------------------------
+      - name: 🔀 Open a sync PR for review
         if: steps.sync.outputs.conflict == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CONFLICTS: ${{ steps.sync.outputs.conflicts }}
         run: |
-          git push --force origin refs/remotes/upstream/main:refs/heads/upstream-sync
-          if [[ -z "$(gh pr list --head upstream-sync --state open --json number --jq '.[].number')" ]]; then
-            gh pr create --head upstream-sync --base main \
-              --title "⬆️ Merge upstream changes (manual resolution needed)" \
-              --body "The nightly job could not merge \`hassio-addons/app-vaultwarden@main\` cleanly. Resolve the conflicts here — usually the Dockerfile, where upstream has caught up to a Vaultwarden bump we already shipped."
-          else
-            echo "Sync PR already open."
+          if [[ -n "$(gh pr list --head upstream-sync --state open --json number --jq '.[].number')" ]]; then
+            echo "Sync PR already open; leaving it for a human."
+            exit 0
           fi
+
+          body=$(
+            echo "The nightly merge of \`hassio-addons/app-vaultwarden@main\` hit conflicts in:"
+            echo ""
+            while read -r f; do [[ -n "${f}" ]] && echo "- \`${f}\`"; done <<<"${CONFLICTS}"
+            echo ""
+            echo "Our side was kept, so this branch is mergeable as-is — but check the"
+            echo "diff for anything upstream changed that we actually want. Usually this"
+            echo "is the Dockerfile, where upstream re-pins the apt packages we unpinned"
+            echo "on purpose."
+          )
+
+          if ! git push --force origin HEAD:refs/heads/upstream-sync; then
+            title="🔀 Upstream needs a manual merge"
+            existing=$(gh issue list --state open --search "${title} in:title" --json number --jq '.[0].number')
+            issue_body=$(printf '%s\n\n```sh\ngit fetch upstream && git merge upstream/main\n```\n\n%s\n' \
+              'Could not push the resolved merge, so no PR was opened. Merge it locally:' "${body}")
+            if [[ -n "${existing}" ]]; then
+              gh issue comment "${existing}" --body "${issue_body}"
+            else
+              gh issue create --title "${title}" --body "${issue_body}"
+            fi
+            exit 1
+          fi
+
+          gh pr create --head upstream-sync --base main \
+            --title "⬆️ Merge upstream changes (review needed)" \
+            --body "${body}"
 
       - name: ⬆️ Check for a new Vaultwarden release
         if: steps.sync.outputs.conflict != 'true'
@@ -164,7 +246,7 @@ jobs:
         run: |
           {
             if [[ "${{ steps.sync.outputs.conflict }}" == "true" ]]; then
-              echo "## 🔀 Upstream needs manual merge"
+              echo "## 🔀 Upstream merge needs review"
             elif [[ "${{ steps.bump.outputs.changed }}" == "true" ]]; then
               echo "## ✅ Shipped add-on v${{ steps.bump.outputs.addon_new }}"
               echo ""
