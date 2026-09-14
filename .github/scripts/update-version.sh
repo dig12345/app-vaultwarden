@@ -47,25 +47,38 @@ emit vw_current "${vw_current}"
 emit vw_latest "${vw_latest}"
 emit addon_current "${addon_current}"
 
-# --- decide the new add-on version --------------------------------------------
-# Vaultwarden moved   -> add-on version tracks it exactly (1.37.1)
-# glue-only change    -> append/increment a build suffix (1.37.1 -> 1.37.1-2)
-if [[ "${vw_current}" != "${vw_latest}" ]]; then
-    if [[ "$(printf '%s\n%s\n' "${vw_current}" "${vw_latest}" | sort -V | tail -1)" != "${vw_latest}" ]]; then
-        echo "::warning::Latest tag ${vw_latest} sorts below current ${vw_current}; refusing to downgrade"
-        emit changed false
-        exit 0
-    fi
-    sed -i -E "s|^FROM \"vaultwarden/server:.+\" AS vaultwarden\$|FROM \"vaultwarden/server:${vw_latest}\" AS vaultwarden|" "${DOCKERFILE}"
-    addon_new="${vw_latest}"
-elif [[ "${glue_changed}" == true ]]; then
-    if [[ "${addon_current}" =~ ^(.+)-([0-9]+)$ ]]; then
-        addon_new="${BASH_REMATCH[1]}-$((BASH_REMATCH[2] + 1))"
-    else
-        addon_new="${addon_current}-2"
-    fi
+# --- settle on the Vaultwarden version to ship --------------------------------
+# The Dockerfile can already be ahead of anything we would pick ourselves, when
+# an upstream merge carried their own bump in. Take whichever is newer.
+if [[ "${vw_current}" == "${vw_latest}" ]]; then
+    vw_target="${vw_current}"
+elif [[ "$(printf '%s\n%s\n' "${vw_current}" "${vw_latest}" | sort -V | tail -1)" == "${vw_latest}" ]]; then
+    vw_target="${vw_latest}"
+    sed -i -E "s|^FROM \"vaultwarden/server:.+\" AS vaultwarden\$|FROM \"vaultwarden/server:${vw_target}\" AS vaultwarden|" "${DOCKERFILE}"
 else
-    echo "Already on ${vw_current}; no upstream changes to ship."
+    echo "::warning::Latest tag ${vw_latest} sorts below the Dockerfile's ${vw_current}; keeping ${vw_current}"
+    vw_target="${vw_current}"
+fi
+
+# --- decide the new add-on version --------------------------------------------
+# The add-on version tracks the Vaultwarden version it ships (1.37.3). A
+# trailing -N distinguishes rebuilds carrying the same Vaultwarden (1.37.3-2).
+# Comparing against the base is what keeps the two from drifting apart when the
+# Dockerfile bump arrived via a merge rather than from this script.
+if [[ "${addon_current}" =~ ^(.+)-([0-9]+)$ ]]; then
+    addon_base="${BASH_REMATCH[1]}"
+    addon_suffix="${BASH_REMATCH[2]}"
+else
+    addon_base="${addon_current}"
+    addon_suffix=1
+fi
+
+if [[ "${addon_base}" != "${vw_target}" ]]; then
+    addon_new="${vw_target}"
+elif [[ "${glue_changed}" == true ]]; then
+    addon_new="${addon_base}-$((addon_suffix + 1))"
+else
+    echo "Already shipping ${vw_target} as ${addon_current}; nothing to do."
     emit changed false
     exit 0
 fi
