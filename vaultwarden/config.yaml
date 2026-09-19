@@ -1,6 +1,6 @@
 ---
 name: Vaultwarden (dig)
-version: 1.37.3
+version: 1.37.3-2
 slug: bitwarden
 description: Open source password management solution
 url: https://github.com/dig12345/app-vaultwarden
