@@ -19,6 +19,10 @@ concurrency:
 
 env:
   UPSTREAM: https://github.com/hassio-addons/app-vaultwarden.git
+  # The job adds an "upstream" remote, and gh prefers a remote named
+  # "upstream" when picking its repo, so without this every gh pr/issue
+  # call targets hassio-addons and fails with "Resource not accessible".
+  GH_REPO: ${{ github.repository }}
 
 jobs:
   nightly:
